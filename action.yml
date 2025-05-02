@@ -1,0 +1,181 @@
+name: PR Code Coverage Checker
+
+description: >
+  GitHub Action to enforce code coverage on only the changed lines in a pull request.
+  Also calculates and optionally enforces total project coverage. Supports configurable thresholds,
+  file and directory exclusions (with regex), and bypass options.
+
+inputs:
+  go-version:
+    description: 'Go version to use'
+    required: false
+    default: '1.20'
+
+  min-coverage:
+    description: 'Minimum allowed PR coverage (%)'
+    required: false
+    default: '80'
+
+  min-total-coverage:
+    description: 'Minimum allowed total project coverage (%)'
+    required: false
+    default: '75'
+
+  exclude-files:
+    description: 'Newline-separated regex patterns to exclude specific files'
+    required: false
+    default: ''
+
+  exclude-dirs:
+    description: 'Newline-separated regex patterns to exclude directories'
+    required: false
+    default: ''
+
+  bypass-threshold:
+    description: 'If true, skips the PR coverage threshold check'
+    required: false
+    default: 'false'
+
+  bypass-total-coverage:
+    description: 'If true, skips the total project coverage threshold check'
+    required: false
+    default: 'false'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ inputs.go-version }}
+
+    - name: Run PR Coverage Check
+      shell: bash
+      run: |
+        set -e
+
+        BASE_BRANCH="${GITHUB_BASE_REF:-main}"
+        echo "🔄 Comparing against base branch: $BASE_BRANCH"
+
+        git fetch origin "$BASE_BRANCH" --depth=1
+
+        echo "🧪 Running tests with coverage..."
+        go test -cover -coverprofile=coverage.out ./...
+
+        echo "🌐 Getting Go module import path..."
+        module_path=$(go list -m)
+
+        echo "🧼 Filtering changed Go files..."
+        changed_files=$(git diff --name-only origin/$BASE_BRANCH | grep '\.go$' | grep -v '_test.go$')
+
+        # Apply regex exclusions for files and directories (newline-separated)
+        if [[ -n "${{ inputs.exclude-files }}" ]]; then
+          while IFS= read -r pattern; do
+            [[ -z "$pattern" ]] && continue
+            changed_files=$(echo "$changed_files" | grep -Ev "$pattern" || true)
+          done <<< "${{ inputs.exclude-files }}"
+        fi
+
+        if [[ -n "${{ inputs.exclude-dirs }}" ]]; then
+          while IFS= read -r pattern; do
+            [[ -z "$pattern" ]] && continue
+            changed_files=$(echo "$changed_files" | grep -Ev "$pattern" || true)
+          done <<< "${{ inputs.exclude-dirs }}"
+        fi
+
+        echo "✅ Files to check for coverage:" && echo "$changed_files"
+
+        echo "mode: set" > coverage_pr.out
+        total_changed_lines=0
+        total_covered_lines=0
+
+        for file in $changed_files; do
+          if [ ! -f "$file" ]; then continue; fi
+
+          changed_lines_file=$(mktemp)
+
+          git diff -U0 origin/$BASE_BRANCH -- "$file" | awk '
+            /^\+\+\+ b\// {
+              current_file = substr($0, 7)
+              next
+            }
+            /^@@/ {
+              n = split($0, parts, " ")
+              new_block = parts[3]
+              new_block = substr(new_block, 2)
+              split(new_block, nums, ",")
+              start = nums[1]
+              count = (length(nums) > 1) ? nums[2] : 1
+              for (i = 0; i < count; i++) {
+                print current_file ":" start + i
+              }
+            }
+          ' | sort -t: -k1,1 -k2n | uniq > "$changed_lines_file"
+
+          full_path="$module_path/$file"
+          grep "^$full_path:" coverage.out >> coverage_pr.out || echo "⚠️  No coverage data for $file"
+
+          total_lines_this_file=0
+          covered_lines=0
+
+          while IFS=":" read -r changed_file line_number; do
+            while read -r coverage_line; do
+              coverage_file=$(echo "$coverage_line" | cut -d: -f1)
+              range=$(echo "$coverage_line" | cut -d: -f2 | awk '{print $1}')
+              count=$(echo "$coverage_line" | awk '{print $3}')
+
+              start_line=$(echo "$range" | cut -d',' -f1 | cut -d'.' -f1)
+              end_line=$(echo "$range" | cut -d',' -f2 | cut -d'.' -f1)
+
+              if [[ "$coverage_file" == "$full_path" && "$line_number" -ge "$start_line" && "$line_number" -le "$end_line" ]]; then
+                total_lines_this_file=$((total_lines_this_file + 1))
+                if [[ "$count" -gt 0 ]]; then
+                  covered_lines=$((covered_lines + 1))
+                fi
+                break
+              fi
+            done < coverage.out
+          done < "$changed_lines_file"
+
+          total_changed_lines=$((total_changed_lines + total_lines_this_file))
+          total_covered_lines=$((total_covered_lines + covered_lines))
+
+          rm "$changed_lines_file"
+        done
+
+        if [ "$total_changed_lines" -gt 0 ]; then
+          pr_coverage=$(echo "scale=2; $total_covered_lines * 100 / $total_changed_lines" | bc)
+        else
+          pr_coverage=100
+        fi
+
+        # Get total project coverage from go tool cover
+        total_coverage=$(go tool cover -func=coverage.out | grep -E "^total:" | awk '{print $3}')
+        total_coverage_pct=$(echo "$total_coverage" | sed 's/%//')
+
+        echo "======================================"
+        echo "📊 Total Project Coverage: $total_coverage"
+        echo "🔍 PR Code Coverage: $pr_coverage% ($total_covered_lines/$total_changed_lines)"
+        echo "======================================"
+
+        if [[ "${{ inputs.bypass-threshold }}" != "true" ]]; then
+          if (( $(echo "$pr_coverage < ${{ inputs.min-coverage }}" | bc -l) )); then
+            echo "::error::PR coverage ($pr_coverage%) is below required threshold of ${{ inputs.min-coverage }}%"
+            exit 1
+          else
+            echo "✅ PR coverage is above threshold"
+          fi
+        else
+          echo "🚨 PR coverage threshold bypass enabled. Skipping enforcement."
+        fi
+
+        if [[ "${{ inputs.bypass-total-coverage }}" != "true" ]]; then
+          if (( $(echo "$total_coverage_pct < ${{ inputs.min-total-coverage }}" | bc -l) )); then
+            echo "::error::Total project coverage ($total_coverage_pct%) is below required threshold of ${{ inputs.min-total-coverage }}%"
+            exit 1
+          else
+            echo "✅ Total project coverage is above threshold"
+          fi
+        else
+          echo "🚨 Total coverage threshold bypass enabled. Skipping enforcement."
+        fi
